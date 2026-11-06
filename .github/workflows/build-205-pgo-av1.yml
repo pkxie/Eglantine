@@ -1,0 +1,287 @@
+name: Build 205 PGO + AV1 (PR 675)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-205-pgo-av1-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 5cad1588350a6edef11f6302dcf747dc7dffa8df
+  FIX_SHA: ed6e20ebd142598c25118e6c7e2052ba425b2e6e
+
+jobs:
+  windows-pgo-av1:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: msys2 {0}
+        working-directory: source
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/source/.ccache
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - name: Check out the exact build 205 source
+        uses: actions/checkout@v5
+        with:
+          repository: Djihads80/Eglantine
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the original MinGW PGO toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            git make autoconf libtool automake-wrapper patch jq pactoys ninja
+          pacboy: >-
+            toolchain:p clang:p lld:p cmake:p python-pip:p
+            qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p libiconv:p
+            vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
+            libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
+            lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
+
+      - name: Apply only PR 675 to build 205
+        run: |
+          set -euo pipefail
+          mkdir -p ci-checks
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch --no-tags --depth=2 origin "$FIX_SHA"
+          test "$(git rev-parse FETCH_HEAD)" = "$FIX_SHA"
+          expected=$'cpmfile.json\nexternals/ffmpeg/CMakeLists.txt'
+          actual=$(git diff-tree --no-commit-id --name-only -r FETCH_HEAD | sort)
+          test "$actual" = "$expected"
+          git diff "$FIX_SHA^" "$FIX_SHA" -- cpmfile.json externals/ffmpeg/CMakeLists.txt > ci-checks/pr675.patch
+          git apply --check ci-checks/pr675.patch
+          git apply ci-checks/pr675.patch
+          test "$(git diff --name-only | sort)" = "$expected"
+          test "$(git hash-object eglantine.profdata)" = 6e41f7d66d9831a9358d9ea34933df5c5e21b6aa
+          sha256sum eglantine.profdata > ci-checks/profile-sha256.txt
+          git diff --check
+
+      - name: Cache source dependencies and compiler objects
+        uses: actions/cache@v5
+        with:
+          path: |
+            source/.cache/cpm
+            source/.ccache
+          key: build205-pr675-${{ runner.os }}-${{ env.SOURCE_SHA }}-${{ env.FIX_SHA }}-v1
+
+      - name: Prepare a real AV1 decode check
+        run: |
+          set -euo pipefail
+          cat > ci-checks/av1-probe.c <<'C'
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <libavcodec/avcodec.h>
+          #include <libavutil/error.h>
+          
+          static int drain(AVCodecContext *ctx, AVFrame *frame, int *count) {
+              int ret;
+              while ((ret = avcodec_receive_frame(ctx, frame)) >= 0) {
+                  ++*count;
+                  av_frame_unref(frame);
+              }
+              return ret == AVERROR(EAGAIN) || ret == AVERROR_EOF ? 0 : ret;
+          }
+          
+          int main(int argc, char **argv) {
+              int result = 1, count = 0, ret = 0;
+              FILE *file = NULL;
+              AVCodecContext *ctx = NULL;
+              AVPacket *packet = NULL;
+              AVFrame *frame = NULL;
+              const AVCodec *decoder = avcodec_find_decoder(AV_CODEC_ID_AV1);
+              unsigned char header[32], frame_header[12];
+              if (argc != 2 || !decoder || strcmp(decoder->name, "libdav1d") != 0) {
+                  fprintf(stderr, "Expected the libdav1d AV1 decoder\n");
+                  goto done;
+              }
+              ctx = avcodec_alloc_context3(decoder);
+              packet = av_packet_alloc();
+              frame = av_frame_alloc();
+              if (!ctx || !packet || !frame || (ret = avcodec_open2(ctx, decoder, NULL)) < 0)
+                  goto done;
+              file = fopen(argv[1], "rb");
+              if (!file || fread(header, 1, sizeof(header), file) != sizeof(header) ||
+                  memcmp(header, "DKIF", 4) || memcmp(header + 8, "AV01", 4))
+                  goto done;
+              for (;;) {
+                  size_t got = fread(frame_header, 1, sizeof(frame_header), file);
+                  if (!got && feof(file)) break;
+                  if (got != sizeof(frame_header)) goto done;
+                  uint32_t size = (uint32_t)frame_header[0] | ((uint32_t)frame_header[1] << 8) |
+                                  ((uint32_t)frame_header[2] << 16) | ((uint32_t)frame_header[3] << 24);
+                  if (!size || size > 16 * 1024 * 1024 || av_new_packet(packet, (int)size) < 0)
+                      goto done;
+                  if (fread(packet->data, 1, size, file) != size) goto done;
+                  ret = avcodec_send_packet(ctx, packet);
+                  av_packet_unref(packet);
+                  if (ret < 0 || (ret = drain(ctx, frame, &count)) < 0) goto done;
+              }
+              if ((ret = avcodec_send_packet(ctx, NULL)) < 0 ||
+                  (ret = drain(ctx, frame, &count)) < 0 || count != 3)
+                  goto done;
+              printf("PASS: decoder=%s decoded_frames=%d\n", decoder->name, count);
+              result = 0;
+          done:
+              if (result) fprintf(stderr, "AV1 verification failed: ret=%d frames=%d\n", ret, count);
+              if (file) fclose(file);
+              av_frame_free(&frame);
+              av_packet_free(&packet);
+              avcodec_free_context(&ctx);
+              return result;
+          }
+          C
+          cat > ci-checks/probe.cmake <<'CMAKE'
+          function(add_ci_av1_probe)
+            if(NOT TARGET FFmpeg::FFmpeg)
+              message(FATAL_ERROR "The emulator's FFmpeg target was not created")
+            endif()
+            add_executable(ci_av1_probe "${CMAKE_SOURCE_DIR}/ci-checks/av1-probe.c")
+            target_link_libraries(ci_av1_probe PRIVATE FFmpeg::FFmpeg)
+            set_target_properties(ci_av1_probe PROPERTIES
+              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ci-checks")
+          endfunction()
+          cmake_language(DEFER CALL add_ci_av1_probe)
+          CMAKE
+          printf '%s' 'REtJRgAAIABBVjAxEAAQAB4AAAABAAAAAwAAAAAAAAAeAAAAAAAAAAAAAAASAAoKAAAAAZ/5tfIAgDIOEADQAAACgAAAAKmOXtAVAAAAAQAAAAAAAAASADIRMAPAgAAABtAAAAKAACAAdpAVAAAAAgAAAAAAAAASADIRMAXBBAAABtAAAAKAACAAeZA=' | base64 --decode > ci-checks/av1-test.ivf
+          printf '%s\n' '5f8d55c1d066807597d2a38c5e5998350d2ed3beb197d898abf776055a65f1a9  ci-checks/av1-test.ivf' | sha256sum --check
+
+      - name: Configure with the original build 205 PGO profile
+        run: |
+          set -euo pipefail
+          clang --version | tee ci-checks/compiler.txt
+          pacman -Q > ci-checks/packages.txt
+          profile="-fprofile-use=$(cygpath -m "$PWD/eglantine.profdata") -Wno-backend-plugin -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+          printf 'int main(void) { return 0; }\n' > ci-checks/profile-probe.c
+          clang $profile -fuse-ld=lld ci-checks/profile-probe.c -o ci-checks/profile-probe.exe
+          ./ci-checks/profile-probe.exe
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DUSE_CCACHE=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+            "-DCMAKE_C_FLAGS=$profile" "-DCMAKE_CXX_FLAGS=$profile" \
+            "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=$(cygpath -m "$PWD/ci-checks/probe.cmake")" \
+            2>&1 | tee ci-checks/configure.log
+          grep -Fq -- '-fprofile-use=' build/release/build.ninja
+          grep -Fq -- 'YUZU_USE_BUNDLED_FFMPEG:BOOL=ON' build/release/CMakeCache.txt
+
+      - name: Verify the PR 675 AV1 library before building the emulator
+        run: |
+          set -euo pipefail
+          cmake --build build/release --target ci_av1_probe --parallel 4 2>&1 | tee ci-checks/probe-build.log
+          ./build/release/ci-checks/ci_av1_probe.exe ci-checks/av1-test.ivf | tee ci-checks/av1-before-package.txt
+
+      - name: Build the PGO emulator
+        run: |
+          set -euo pipefail
+          cmake --build build/release --target yuzu yuzu-cmd --parallel 4 2>&1 | tee ci-checks/build.log
+          ccache --show-stats | tee ci-checks/ccache.txt
+
+      - name: Package matching Qt and MinGW runtime libraries
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:$PATH"
+          stage="$PWD/package"
+          mkdir -p "$stage"
+          cp build/release/bin/eglantine.exe build/release/bin/eden-cli.exe "$stage/"
+          cp build/release/ci-checks/ci_av1_probe.exe "$stage/"
+          windeployqt6 --no-translations --no-compiler-runtime --no-opengl-sw \
+            --no-system-dxc-compiler --no-system-d3d-compiler "$stage/eglantine.exe"
+          system_dir="$(cygpath -u "${SYSTEMROOT:-C:\\Windows}")/System32"
+          deps() {
+            local input="$1" dll source
+            while IFS= read -r dll; do
+              [ -n "$dll" ] || continue
+              case "${dll,,}" in api-ms-*|ext-ms-*) continue ;; esac
+              [ ! -f "$stage/$dll" ] || continue
+              source="/ucrt64/bin/$dll"
+              if [ -f "$source" ]; then
+                cp "$source" "$stage/$dll"
+                deps "$source"
+              elif [ ! -f "$system_dir/$dll" ]; then
+                printf 'Missing runtime DLL: %s (imported by %s)\n' "$dll" "$input" >&2
+                return 1
+              fi
+            done < <(objdump -p "$input" | awk '/DLL Name:/ {print $3}')
+          }
+          mapfile -t binaries < <(find "$stage" -type f \( -iname '*.exe' -o -iname '*.dll' \))
+          for binary in "${binaries[@]}"; do deps "$binary"; done
+
+      - name: Check packaged executables without the MSYS2 DLL search path
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import json, os, subprocess
+          root = Path.cwd()
+          stage = root / "package"
+          env = os.environ.copy()
+          system = Path(env.get("SYSTEMROOT", env.get("SystemRoot", "C:/Windows")))
+          env["PATH"] = os.pathsep.join([str(stage), str(system / "System32"), str(system)])
+          commands = [
+              [str(stage / "ci_av1_probe.exe"), str(root / "ci-checks/av1-test.ivf")],
+              [str(stage / "eden-cli.exe"), "-h"],
+          ]
+          results = []
+          for command in commands:
+              run = subprocess.run(command, cwd=stage, env=env, capture_output=True, text=True, timeout=60)
+              print(run.stdout, end="")
+              print(run.stderr, end="")
+              results.append({"program": Path(command[0]).name, "exit_code": run.returncode,
+                              "stdout": run.stdout, "stderr": run.stderr})
+              if run.returncode:
+                  raise SystemExit(f"Packaged executable failed: {command[0]} ({run.returncode})")
+          (root / "ci-checks/packaged-runtime.json").write_text(json.dumps(results, indent=2))
+          PY
+          mv "$PWD/package/ci_av1_probe.exe" "$PWD/ci-checks/packaged-av1-probe.exe"
+          {
+            printf 'Eglantine build 205 PGO + AV1, PR 675\nSource: %s\nFix: %s\n' "$SOURCE_SHA" "$FIX_SHA"
+            printf 'Source URL: https://github.com/Djihads80/Eglantine/tree/%s\n' "$SOURCE_SHA"
+            printf 'PR URL: https://github.com/Djihads80/Eglantine/pull/675\n'
+            printf 'Profile: original build 205 eglantine.profdata\n'
+            cat ci-checks/profile-sha256.txt ci-checks/compiler.txt
+          } > package/BUILD-INFO.txt
+          (cd package && find . -type f -print0 | sort -z | xargs -0 sha256sum) > ci-checks/package-sha256.txt
+          cp ci-checks/package-sha256.txt package/SHA256SUMS.txt
+
+      - name: Upload the verified Windows PGO + AV1 package
+        uses: actions/upload-artifact@v7
+        with:
+          name: eglantine-build205-windows-x86_64-pgo-av1-pr675
+          path: source/package/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build205-pr675-diagnostics
+          path: |
+            source/ci-checks/*.txt
+            source/ci-checks/*.log
+            source/ci-checks/*.json
+            source/ci-checks/*.patch
+            source/build/release/CMakeCache.txt
+          if-no-files-found: warn
+          retention-days: 7
