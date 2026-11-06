@@ -155,7 +155,7 @@ jobs:
               message(FATAL_ERROR "The emulator's FFmpeg target was not created")
             endif()
             add_executable(ci_av1_probe "${CMAKE_SOURCE_DIR}/ci-checks/av1-probe.c")
-            target_link_libraries(ci_av1_probe PRIVATE FFmpeg::FFmpeg)
+            target_link_libraries(ci_av1_probe PRIVATE FFmpeg::FFmpeg ZLIB::ZLIB)
             set_target_properties(ci_av1_probe PROPERTIES
               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ci-checks")
           endfunction()
